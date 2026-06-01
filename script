@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+
+import re
+import json
+import csv
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+
+NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NIST_URL_BASE = "https://nvd.nist.gov/vuln/detail/"
+
+# Si procesas muchas CVEs y NVD te bloquea por rate limit, sube esto a 6.
+RETARDO_ENTRE_CONSULTAS = 1.0
+
+
+def extraer_campo(texto, campo):
+    """
+    Extrae campos tipo:
+    cve:"CVE-2026-43459"
+    cvss_v3_overall_value: 7.3
+    fecha_inclusion:"2026-05-21 17:30:00.0"
+    """
+
+    patron = rf'(?im)^\s*{re.escape(campo)}\s*:\s*"?([^"\n\r]+?)"?\s*$'
+    match = re.search(patron, texto)
+
+    if match:
+        return match.group(1).strip()
+
+    # Fallback por si el texto viene todo en una línea.
+    patron_fallback = rf'{re.escape(campo)}\s*:\s*"?(.+?)(?=\s+[a-zA-Z_][a-zA-Z0-9_]*\s*:|$)'
+    match = re.search(patron_fallback, texto, re.IGNORECASE | re.DOTALL)
+
+    if not match:
+        return ""
+
+    return match.group(1).strip().strip('"').strip()
+
+
+def dividir_alertas(texto):
+    """
+    Divide el texto pegado en bloques independientes.
+    Cada bloque empieza en un campo cve:"CVE-....".
+
+    También soporta pegar solo una lista de CVEs.
+    """
+
+    posiciones = [
+        m.start()
+        for m in re.finditer(
+            r'(?i)(?<![a-zA-Z0-9_])cve\s*:\s*"?CVE-\d{4}-\d{4,}"?',
+            texto
+        )
+    ]
+
+    if posiciones:
+        bloques = []
+
+        for i, inicio in enumerate(posiciones):
+            fin = posiciones[i + 1] if i + 1 < len(posiciones) else len(texto)
+            bloque = texto[inicio:fin].strip()
+
+            if bloque:
+                bloques.append(bloque)
+
+        return bloques
+
+    # Si no hay formato cve:"...", buscamos CVEs sueltas.
+    cves = sorted(set(re.findall(r"CVE-\d{4}-\d{4,}", texto, re.IGNORECASE)))
+
+    return [f'cve:"{cve.upper()}"' for cve in cves]
+
+
+def consultar_nvd(cve_id):
+    params = urllib.parse.urlencode({"cveIds": cve_id})
+    url = f"{NVD_API}?{params}"
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "python-cve-helper/1.0"}
+    )
+
+    for intento in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            vulnerabilidades = data.get("vulnerabilities", [])
+
+            if not vulnerabilidades:
+                return None
+
+            return vulnerabilidades[0]["cve"]
+
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429) and intento < 2:
+                print(f"Rate limit de NVD para {cve_id}. Reintentando en 6 segundos...")
+                time.sleep(6)
+                continue
+
+            raise
+
+    return None
+
+
+def obtener_cvss_desde_nvd(cve_data):
+    """
+    Solo se usa si la alerta no trae cvss_v3_overall_value.
+    Prioriza CVSS v3.1.
+    """
+
+    metrics = cve_data.get("metrics", {})
+
+    for clave in ["cvssMetricV31", "cvssMetricV30"]:
+        metricas = metrics.get(clave, [])
+
+        if metricas:
+            cvss_data = metricas[0].get("cvssData", {})
+            base_score = cvss_data.get("baseScore", "")
+
+            if base_score != "":
+                return str(base_score)
+
+    return ""
+
+
+def normalizar_cpe(cpe):
+    """
+    Soporta:
+    cpe:2.3:o:linux:linux_kernel:6.8.6:*.*.*.*.*.*
+    cpe:2.3:o:linux:linux_kernel:6.8.6:*:*:*:*:*:*:*
+    """
+
+    cpe = str(cpe).strip()
+
+    if not cpe.startswith("cpe:2.3:"):
+        return None
+
+    partes = cpe.split(":")
+
+    return {
+        "part": partes[2] if len(partes) > 2 else "",
+        "vendor": partes[3] if len(partes) > 3 else "",
+        "product": partes[4] if len(partes) > 4 else "",
+        "version": partes[5] if len(partes) > 5 else "*",
+        "raw": cpe,
+    }
+
+
+def extraer_cpes_vulnerables(cve_data):
+    resultados = []
+
+    def recorrer_nodos(nodos):
+        for nodo in nodos:
+            for cpe_match in nodo.get("cpeMatch", []):
+                if not cpe_match.get("vulnerable", False):
+                    continue
+
+                resultados.append({
+                    "criteria": cpe_match.get("criteria", ""),
+                    "versionStartIncluding": cpe_match.get("versionStartIncluding", ""),
+                    "versionStartExcluding": cpe_match.get("versionStartExcluding", ""),
+                    "versionEndIncluding": cpe_match.get("versionEndIncluding", ""),
+                    "versionEndExcluding": cpe_match.get("versionEndExcluding", ""),
+                })
+
+            if "nodes" in nodo:
+                recorrer_nodos(nodo["nodes"])
+
+    for configuracion in cve_data.get("configurations", []):
+        recorrer_nodos(configuracion.get("nodes", []))
+
+    return resultados
+
+
+def limpiar_version(version):
+    version = str(version).strip()
+
+    if version in ["", "*", "-", "NA"]:
+        return None
+
+    numeros = re.findall(r"\d+", version)
+
+    if not numeros:
+        return None
+
+    return [int(n) for n in numeros]
+
+
+def comparar_versiones(v1, v2):
+    """
+    Devuelve:
+    -1 si v1 < v2
+     0 si v1 == v2
+     1 si v1 > v2
+    """
+
+    a = limpiar_version(v1)
+    b = limpiar_version(v2)
+
+    if a is None or b is None:
+        return None
+
+    max_len = max(len(a), len(b))
+    a += [0] * (max_len - len(a))
+    b += [0] * (max_len - len(b))
+
+    if a < b:
+        return -1
+
+    if a > b:
+        return 1
+
+    return 0
+
+
+def version_en_rango(version_local, criterio_nvd):
+    version_local = str(version_local).strip()
+
+    if version_local in ["", "*", "-", "NA"]:
+        return True
+
+    start_inc = criterio_nvd.get("versionStartIncluding")
+    start_exc = criterio_nvd.get("versionStartExcluding")
+    end_inc = criterio_nvd.get("versionEndIncluding")
+    end_exc = criterio_nvd.get("versionEndExcluding")
+
+    if start_inc:
+        cmp_result = comparar_versiones(version_local, start_inc)
+        if cmp_result is not None and cmp_result < 0:
+            return False
+
+    if start_exc:
+        cmp_result = comparar_versiones(version_local, start_exc)
+        if cmp_result is not None and cmp_result <= 0:
+            return False
+
+    if end_inc:
+        cmp_result = comparar_versiones(version_local, end_inc)
+        if cmp_result is not None and cmp_result > 0:
+            return False
+
+    if end_exc:
+        cmp_result = comparar_versiones(version_local, end_exc)
+        if cmp_result is not None and cmp_result >= 0:
+            return False
+
+    return True
+
+
+def mismo_producto(cpe_local, cpe_nvd):
+    local = normalizar_cpe(cpe_local)
+    nvd = normalizar_cpe(cpe_nvd)
+
+    if not local or not nvd:
+        return False
+
+    return (
+        local["part"] == nvd["part"]
+        and local["vendor"] == nvd["vendor"]
+        and local["product"] == nvd["product"]
+    )
+
+
+def cpe_aplica_a_criterio(cpe_local, criterio_nvd):
+    cpe_nvd = criterio_nvd["criteria"]
+
+    local = normalizar_cpe(cpe_local)
+    nvd = normalizar_cpe(cpe_nvd)
+
+    if not local or not nvd:
+        return False
+
+    if not mismo_producto(cpe_local, cpe_nvd):
+        return False
+
+    version_local = local["version"]
+    version_nvd = nvd["version"]
+
+    # Caso 1: NVD indica una versión concreta.
+    if version_nvd not in ["", "*", "-"]:
+        return version_local == version_nvd
+
+    # Caso 2: NVD indica rango de versiones.
+    tiene_rango = any([
+        criterio_nvd.get("versionStartIncluding"),
+        criterio_nvd.get("versionStartExcluding"),
+        criterio_nvd.get("versionEndIncluding"),
+        criterio_nvd.get("versionEndExcluding"),
+    ])
+
+    if tiene_rango:
+        return version_en_rango(version_local, criterio_nvd)
+
+    # Caso 3: NVD marca todo el producto como vulnerable.
+    return True
+
+
+def detectar_cpes_afectados(cpes_locales, criterios_nvd):
+    afectados = []
+
+    for cpe_local in cpes_locales:
+        cpe_local = cpe_local.strip()
+
+        if not cpe_local:
+            continue
+
+        for criterio in criterios_nvd:
+            if cpe_aplica_a_criterio(cpe_local, criterio):
+                afectados.append(cpe_local)
+                break
+
+    return sorted(set(afectados))
+
+
+def leer_cpes_locales(ruta="cpes.txt"):
+    path = Path(ruta)
+
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el fichero {ruta}")
+
+    return [
+        linea.strip()
+        for linea in path.read_text(encoding="utf-8").splitlines()
+        if linea.strip()
+    ]
+
+
+def escribir_filas_tsv(filas, ruta="fila_excel.tsv"):
+    with open(ruta, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(
+            f,
+            delimiter="\t",
+            quotechar='"',
+            quoting=csv.QUOTE_MINIMAL
+        )
+        writer.writerows(filas)
+
+
+def procesar_alerta(bloque_alerta, cpes_locales, cache_nvd):
+    cve_id = extraer_campo(bloque_alerta, "cve").upper()
+    cvss = extraer_campo(bloque_alerta, "cvss_v3_overall_value")
+    fecha = extraer_campo(bloque_alerta, "fecha_inclusion")
+
+    if not cve_id:
+        return None, "Bloque sin CVE. Se omite."
+
+    if cve_id in cache_nvd:
+        cve_data = cache_nvd[cve_id]
+    else:
+        cve_data = consultar_nvd(cve_id)
+        cache_nvd[cve_id] = cve_data
+        time.sleep(RETARDO_ENTRE_CONSULTAS)
+
+    if not cve_data:
+        fila_error = [
+            cve_id,
+            cvss,
+            "",
+            fecha,
+            "NVD no ha devuelto datos para este CVE. Revisar manualmente.",
+            NIST_URL_BASE + cve_id,
+        ]
+        return fila_error, f"{cve_id}: sin datos en NVD."
+
+    if not cvss:
+        cvss = obtener_cvss_desde_nvd(cve_data)
+
+    criterios_nvd = extraer_cpes_vulnerables(cve_data)
+    afectados = detectar_cpes_afectados(cpes_locales, criterios_nvd)
+
+    if afectados:
+        activos_afectados = "\n".join(afectados)
+    else:
+        activos_afectados = "No se han detectado CPEs internos afectados. Revisar manualmente."
+
+    url_nist = NIST_URL_BASE + cve_id
+
+    fila = [
+        cve_id,              # Columna A - CVE ID
+        cvss,                # Columna B - CVSS 3.1
+        "",                  # Columna C - Descripción vacía
+        fecha,               # Columna D - Fecha
+        activos_afectados,   # Columna E - Activos afectados
+        url_nist,            # Columna F - Recomendaciones
+    ]
+
+    return fila, f"{cve_id}: procesado correctamente."
+
+
+def main():
+    print("Pega una o varias alertas completas.")
+    print("Cuando termines, escribe FIN en una línea nueva y pulsa Enter.\n")
+
+    lineas = []
+
+    while True:
+        linea = input()
+
+        if linea.strip().upper() == "FIN":
+            break
+
+        lineas.append(linea)
+
+    texto = "\n".join(lineas)
+    bloques = dividir_alertas(texto)
+
+    if not bloques:
+        print("ERROR: No se ha encontrado ningún CVE.")
+        return
+
+    try:
+        cpes_locales = leer_cpes_locales("cpes.txt")
+    except Exception as e:
+        print(f"ERROR leyendo cpes.txt: {e}")
+        return
+
+    print(f"\nAlertas/CVEs detectadas: {len(bloques)}")
+    print(f"CPEs locales cargados: {len(cpes_locales)}\n")
+
+    filas = []
+    cache_nvd = {}
+
+    for i, bloque in enumerate(bloques, start=1):
+        cve_previa = extraer_campo(bloque, "cve").upper()
+        print(f"[{i}/{len(bloques)}] Procesando {cve_previa or 'bloque sin CVE'}...")
+
+        try:
+            fila, mensaje = procesar_alerta(bloque, cpes_locales, cache_nvd)
+        except Exception as e:
+            cve_error = cve_previa or "CVE desconocido"
+            fila = [
+                cve_error,
+                "",
+                "",
+                "",
+                f"Error procesando este CVE: {e}",
+                NIST_URL_BASE + cve_error if cve_error.startswith("CVE-") else "",
+            ]
+            mensaje = f"{cve_error}: error."
+
+        if fila:
+            filas.append(fila)
+
+        print("   " + mensaje)
+
+    if not filas:
+        print("\nNo se ha generado ninguna fila.")
+        return
+
+    escribir_filas_tsv(filas, "fila_excel.tsv")
+
+    print("\nHecho.")
+    print(f"Se ha creado fila_excel.tsv con {len(filas)} fila(s).")
+    print("Abre ese fichero, copia todas las filas y pégalas en tu Excel final.\n")
+
+    print("Orden de columnas:")
+    print("CVE ID | CVSS 3.1 | Descripción | Fecha | Activos afectados | Recomendaciones")
+
+
+if __name__ == "__main__":
+    main()
